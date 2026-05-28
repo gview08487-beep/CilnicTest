@@ -1422,39 +1422,89 @@
                 .replace(/\u00a0/g, ' ')
                 .replace(/\s+/g, '')
                 .replace(/[.．]/g, '')
-                .replace(/ทันตแพทย์/g, 'ทพ')
                 .replace(/ทันตแพทย์หญิง/g, 'ทพญ')
+                .replace(/ทันตแพทย์/g, 'ทพ')
                 .trim()
                 .toLowerCase();
+        }
+
+        // ดึง "ชื่อแกน" จากชื่อเต็ม เช่น "ทพ.ปฐมพงศ์ เครือจันทร์" → "ปฐมพงศ์"
+        // ใช้สำหรับ fuzzy match กรณีไฟล์รายได้ใส่ชื่อเดี่ยว เช่น "ปฐมพงศ์"
+        function extractCoreName(name) {
+            let s = clean(name)
+                .replace(/\u00a0/g, ' ')
+                .replace(/ทันตแพทย์หญิง/g, '')
+                .replace(/ทันตแพทย์/g, '')
+                .replace(/^ทพญ\.?\s*/i, '')
+                .replace(/^ทพ\.?\s*/i, '')
+                .replace(/^(นพ|นพ\.|พญ|พญ\.|ดร|ดร\.|ผศ|ผศ\.|รศ|รศ\.)\.?\s*/i, '')
+                .replace(/[.．]/g, '')
+                .trim();
+            // แยกเป็นชื่อ-นามสกุล → เอาเฉพาะคำแรก (ชื่อต้น)
+            const parts = s.split(/\s+/).filter(p => p.length > 0);
+            return parts.length > 0 ? parts[0].toLowerCase() : s.toLowerCase();
         }
 
         function applyLabToDoctors() {
             if (!doctorRows.length) return;
 
+            // สร้าง labMap: รวมยอดค่าแลปตามชื่อหมอ (normalized)
             const labMap = new Map();
             for (const row of labRows) {
                 const key = normalizeDoctorName(row.doctor);
                 labMap.set(key, (labMap.get(key) || 0) + num(row.amount));
             }
 
-            const doctorKeyMap = new Map();
+            // สร้าง map ชื่อหมอจากรายได้ — ทั้ง normalized key และ core name
+            const doctorKeyMap = new Map();        // normalized → doctor
+            const doctorCoreMap = new Map();       // coreName → doctor
             for (const row of doctorRows) {
-                doctorKeyMap.set(normalizeDoctorName(row.doctor), row.doctor);
+                const normKey = normalizeDoctorName(row.doctor);
+                const coreKey = extractCoreName(row.doctor);
+                doctorKeyMap.set(normKey, row.doctor);
+                // เก็บ core name → ใช้เป็น fallback matching
+                if (coreKey && coreKey.length >= 2) {
+                    doctorCoreMap.set(coreKey, row.doctor);
+                }
                 labState[row.doctor] = labState[row.doctor] || { labCost: 0, labPercent: 100 };
                 labState[row.doctor].labCost = 0;
             }
 
             unmatchedLabRows = [];
-            for (const [key, amount] of labMap.entries()) {
-                const matchedDoctor = doctorKeyMap.get(key);
+            for (const [labKey, amount] of labMap.entries()) {
+                // 1) Exact normalized match
+                let matchedDoctor = doctorKeyMap.get(labKey);
+
+                // 2) Fallback: ดึง coreName จากชื่อแลป แล้วเทียบกับ coreName ของรายได้
+                if (!matchedDoctor) {
+                    // หาชื่อแลปจริงจาก labRows
+                    const sampleLab = labRows.find(x => normalizeDoctorName(x.doctor) === labKey);
+                    if (sampleLab) {
+                        const labCore = extractCoreName(sampleLab.doctor);
+                        if (labCore && labCore.length >= 2) {
+                            matchedDoctor = doctorCoreMap.get(labCore);
+                        }
+                    }
+                }
+
+                // 3) Fallback: contains-based — ชื่อรายได้ปรากฏภายในชื่อแลป
+                if (!matchedDoctor) {
+                    for (const [normDoc, docName] of doctorKeyMap.entries()) {
+                        if (normDoc.length >= 2 && labKey.includes(normDoc)) {
+                            matchedDoctor = docName;
+                            break;
+                        }
+                    }
+                }
+
                 if (matchedDoctor) {
                     labState[matchedDoctor] = labState[matchedDoctor] || { labCost: 0, labPercent: 100 };
-                    labState[matchedDoctor].labCost = amount;
+                    labState[matchedDoctor].labCost += amount;
                     if (labState[matchedDoctor].labPercent === undefined || labState[matchedDoctor].labPercent === '') {
                         labState[matchedDoctor].labPercent = 100;
                     }
                 } else {
-                    const originals = labRows.filter(x => normalizeDoctorName(x.doctor) === key);
+                    const originals = labRows.filter(x => normalizeDoctorName(x.doctor) === labKey);
                     unmatchedLabRows.push(...originals);
                 }
             }
@@ -1507,8 +1557,24 @@
             setStatus(`✅ นำเข้าข้อมูลสำเร็จ: ประมวลผลแยกเป็น ${branchRows.length} สาขา / พบรายชื่อทันตแพทย์ทั้งหมด ${doctorRows.length} ท่าน`);
         }
 
+        // แปลงชื่อสาขาเต็มเป็นชื่อย่อ
+        function mapBranchName(rawName) {
+            const s = clean(rawName).replace(/\s+/g, ' ');
+            // ถ้าไม่ใช่ชื่อคลินิกหมอฟันคู่ใจ → คืนชื่อเดิม
+            if (!s.includes('หมอฟันคู่ใจ')) return s;
+            // match สาขาตามคีย์เวิร์ด
+            if (/ซอยมังกร/i.test(s)) return 'สาขา 6';
+            if (/บ่อวิน/i.test(s)) return 'สาขา 5';
+            if (/ไปรษณีย์|สาขา\s*4/i.test(s)) return 'สาขา 4';
+            if (/สะพานสี่|สาขา\s*3/i.test(s)) return 'สาขา 3';
+            if (/แหลมฉบัง|สาขา\s*2/i.test(s)) return 'สาขา 2';
+            // ไม่มีคำระบุสาขา = สาขาหลัก (สาขา 1)
+            if (!/สาขา/i.test(s)) return 'สาขา 1';
+            return s;
+        }
+
         function parseBranchFile(fileName, rows) {
-            const branchName = clean(rows?.[1]?.[0]) || fileName.replace(/\.xlsx?$/i, '');
+            const branchName = mapBranchName(clean(rows?.[1]?.[0]) || fileName.replace(/\.xlsx?$/i, ''));
             if (!branchNames.includes(branchName)) branchNames.push(branchName);
 
             let dentistIndex = -1;
